@@ -17,7 +17,7 @@
 # # Load environment variables
 # load_dotenv()
 
-# # Initialize FastAPI app
+# # Initialize FastAPI app6
 # app = FastAPI()
 
 # # Configure MongoDB
@@ -343,6 +343,7 @@
 #     return response
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import io
 import uuid
@@ -373,6 +374,14 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this in production to specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Configure MongoDB
 MONGO_URI = os.getenv("MONGODB_URI")
 client = MongoClient(MONGO_URI)
@@ -385,7 +394,7 @@ if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY not set. Please set it in the .env file.")
 
 genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # Silence detection settings
 SILENCE_THRESHOLD = -35  # dB
@@ -512,22 +521,6 @@ Return a JSON object for each segment:
 - If no category applies, return an empty array for **categories**.
 """
 
-@app.post("/upload")
-async def upload_audio(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        mime_type = magic.from_buffer(contents, mime=True)
-        if not mime_type.startswith("audio/"):
-            raise HTTPException(status_code=400, detail="Invalid file type. Please upload an audio file.")
-
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_path, "wb") as f:
-            f.write(contents)
-
-        return JSONResponse(content={"message": "File uploaded successfully", "filename": file.filename}, status_code=200)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
 @app.post("/upload/")
 async def process_audio(file: UploadFile = File(...), store_id: str = None):
     try:
@@ -630,31 +623,35 @@ async def process_audio(file: UploadFile = File(...), store_id: str = None):
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 @app.get("/get-transcriptions")
 async def get_transcriptions(
-    store_id: str,
-    file_name: str,
-    start: str,
-    end: str,
+    start: str = Query(..., description="Start timestamp in ISO format"),
+    end: str = Query(..., description="End timestamp in ISO format"),
+    store_id: Optional[str] = None,
+    file_name: Optional[str] = None,
     topic: Optional[str] = None
 ):
     logging.info(f"Received request with store_id: {store_id}, file_name: {file_name}, start: {start}, end: {end}, topic: {topic}")
 
-    pipeline = [
-        {
-            "$match": {
-                "store_id": store_id,
-                "file_name": file_name
-            }
-        },
+    pipeline = []
+    
+    match_stage = {}
+    if store_id:
+        match_stage["store_id"] = store_id
+    if file_name:
+        match_stage["file_name"] = file_name
+        
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    pipeline.extend([
         {
             "$unwind": "$transcriptions"
         },
         {
             "$match": {
-                "transcriptions.start": start,
-                "transcriptions.end": end
+                "transcriptions.start": {"$gte": start, "$lte": end}
             }
         }
-    ]
+    ])
 
     # Apply topic filter if provided
     if topic:
@@ -664,16 +661,26 @@ async def get_transcriptions(
             }
         })
 
-    # Project the required fields
-    pipeline.append({
-        "$project": {
-            "_id": 0,
-            "start": "$transcriptions.start",
-            "end": "$transcriptions.end",
-            "transcription": "$transcriptions.transcription",
-            "categories": "$transcriptions.categories"
+    # Project the required fields and apply limits
+    pipeline.extend([
+        {
+            "$project": {
+                "_id": 0,
+                "store_id": 1,
+                "file_name": 1,
+                "start": "$transcriptions.start",
+                "end": "$transcriptions.end",
+                "transcription": "$transcriptions.transcription",
+                "categories": "$transcriptions.categories"
+            }
+        },
+        {
+            "$sort": {"start": -1}
+        },
+        {
+            "$limit": 500
         }
-    })
+    ])
 
     # Run the aggregation pipeline
     result = list(transcription_collection.aggregate(pipeline))
